@@ -5,7 +5,7 @@ This module provides a SQLite-backed short-term memory store to use with AI mess
 ### Key Features
 
 - SQLite-backed persistent storage for short-term AI message memory (file or in-memory database)
-- Configurable maximum messages per key with automatic eviction
+- Configurable per-key limit on the number of interactive messages, enforced on insertion
 - Built-in in-memory caching for improved read performance
 - Support for both direct database configuration and an existing `jdbc:Client`
 - Zero external service dependencies — SQLite runs in-process via the bundled JDBC driver

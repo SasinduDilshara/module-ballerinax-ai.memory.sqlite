@@ -67,10 +67,6 @@ import ballerinax/java.jdbc;
 
 > **Note on table naming**: The `tableName` argument is validated against `^[A-Za-z_][A-Za-z0-9_]*$` and inlined unquoted into SQL. SQLite preserves identifier case but compares identifiers case-insensitively.
 
-## Examples
-
-A runnable example wiring this store into an AI agent is available at [`examples/chat-memory-with-agent`](./examples/chat-memory-with-agent).
-
 ## Build from the source
 
 ### Setting up the prerequisites

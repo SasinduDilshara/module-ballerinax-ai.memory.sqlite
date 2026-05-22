@@ -32,6 +32,12 @@ public type DatabaseConfiguration record {|
     string url = "jdbc:sqlite:./chat_memory.db";
     # Additional options for the SQLite JDBC client
     jdbc:Options options?;
+    # Connection pool configuration.
+    sql:ConnectionPool connectionPool = {
+        maxOpenConnections: 1,
+        minIdleConnections: 1,
+        maxConnectionLifeTime: 0
+    };
 |};
 
 type CachedMessages record {|
@@ -47,15 +53,18 @@ public isolated class ShortTermMemoryStore {
     private final cache:Cache? cache;
     private final int maxMessagesPerKey;
     private final string tableName;
+    // `true` only if the SQLite client was created internally by this store.
+    private final boolean ownsDbClient;
 
     # Initializes the SQLite-backed short-term memory store.
     #
     # + sqliteClient - The SQLite JDBC client or database configuration to connect to the database
-    # + maxMessagesPerKey - The maximum number of interactive messages to store per key
-    # + cacheConfig - The cache configuration for in-memory caching of messages
+    # + maxMessagesPerKey - The maximum number of interactive messages to store per key (must be a
+    # positive integer; default: 20)
+    # + cacheConfig - The cache configuration for in-memory caching of messages (default: no caching)
     # + tableName - The name of the database table to store chat messages (default: "chat_messages").
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
-    # + returns - An error if the initialization fails
+    # + return - An error if the initialization fails
     public isolated function init(jdbc:Client|DatabaseConfiguration sqliteClient,
             int maxMessagesPerKey = 20,
             cache:CacheConfig? cacheConfig = (),
@@ -65,22 +74,40 @@ public isolated class ShortTermMemoryStore {
                 + " Table name must start with a letter or underscore, "
                 + "and can only contain letters, digits, and underscores.");
         }
+        if maxMessagesPerKey < 1 {
+            return error(string `Invalid 'maxMessagesPerKey': ${maxMessagesPerKey}.`
+                + " It must be a positive integer.");
+        }
         self.tableName = tableName;
         if sqliteClient is jdbc:Client {
             self.dbClient = sqliteClient;
+            self.ownsDbClient = false;
         } else {
             jdbc:Client|sql:Error initializedClient = new jdbc:Client(
                 url = sqliteClient.url,
-                options = sqliteClient.options
+                options = sqliteClient.options,
+                connectionPool = sqliteClient.connectionPool
             );
             if initializedClient is sql:Error {
                 return error("Failed to create SQLite client: " + initializedClient.message(), initializedClient);
             }
             self.dbClient = initializedClient;
+            self.ownsDbClient = true;
         }
         self.maxMessagesPerKey = maxMessagesPerKey;
         self.cache = cacheConfig is () ? () : new (cacheConfig);
-        return self.initializeDatabase();
+
+        Error? initResult = self.initializeDatabase();
+        if initResult is Error {
+            // Avoid leaking the connection pool of an internally-created client on init failure.
+            if self.ownsDbClient {
+                sql:Error? closeResult = self.dbClient.close();
+                if closeResult is sql:Error {
+                    // Ignore: surface the original initialization error instead.
+                }
+            }
+            return initResult;
+        }
     }
 
     # Retrieves the system message, if it was provided, for a given key.
@@ -137,16 +164,12 @@ public isolated class ShortTermMemoryStore {
             }
         }
 
-        do {
-            final var allMessages = check self.cacheFromDatabase(key);
-            if allMessages is readonly & ai:ChatInteractiveMessage[] {
-                return allMessages;
-            }
-            var [_, ...interactiveMessages] = allMessages;
-            return interactiveMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
+        final var allMessages = check self.cacheFromDatabase(key);
+        if allMessages is readonly & ai:ChatInteractiveMessage[] {
+            return allMessages;
         }
+        var [_, ...interactiveMessages] = allMessages;
+        return interactiveMessages;
     }
 
     # Retrieves all stored chat messages for a given key.
@@ -166,12 +189,7 @@ public isolated class ShortTermMemoryStore {
             }
         }
 
-        do {
-            final var allMessages = check self.cacheFromDatabase(key);
-            return allMessages;
-        } on fail Error err {
-            return error("Failed to retrieve chat messages: " + err.message(), err);
-        }
+        return self.cacheFromDatabase(key);
     }
 
     # Adds one or more chat messages to the memory store for a given key.
@@ -190,26 +208,35 @@ public isolated class ShortTermMemoryStore {
                 return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
             }
         } else {
-            int|sql:Error currentCount = self.countInteractiveMessages(key);
-            if currentCount is sql:Error {
-                return error("Failed to add chat message: " + currentCount.message(), currentCount);
-            }
-            if currentCount + 1 > self.maxMessagesPerKey {
-                return createExceedsSizeError(self.maxMessagesPerKey, key);
-            }
+            // The capacity check and the insert run in a single transaction so the limit cannot be
+            // bypassed by a concurrent insert landing between the count and the insert.
+            ExceedsSizeError? sizeError = ();
             do {
-                _ = check self.dbClient->execute(
-                    replaceTableNamePlaceholder(`
-                        INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                        VALUES (${key}, ${dbMessage.role}, ${dbMessage.toJsonString()})`,
-                        self.tableName
-                    )
-                );
+                transaction {
+                    int currentCount = check self.countInteractiveMessages(key);
+                    if currentCount + 1 > self.maxMessagesPerKey {
+                        sizeError = createExceedsSizeError(self.maxMessagesPerKey, key);
+                        rollback;
+                    } else {
+                        _ = check self.dbClient->execute(
+                            replaceTableNamePlaceholder(`
+                                INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+                                VALUES (${key}, ${dbMessage.role}, ${dbMessage.toJsonString()})`,
+                                self.tableName
+                            )
+                        );
+                        check commit;
+                    }
+                }
             } on fail error err {
                 return error("Failed to add chat message: " + err.message(), err);
             }
+            if sizeError is ExceedsSizeError {
+                return sizeError;
+            }
         }
 
+        // The cache is updated in place after a successful write so it stays warm.
         final readonly & ai:ChatMessage immutableMessage = mapToImmutableMessage(message);
         lock {
             CachedMessages? cacheEntry = self.getCacheEntry(key);
@@ -231,41 +258,54 @@ public isolated class ShortTermMemoryStore {
 
         final var [newSystemMessages, newInteractiveMessages] = partitionMessagesByType(messages);
         final readonly & ai:ChatSystemMessage? finalChatSystemMessage = getLatestSystemMessage(newSystemMessages);
-        if finalChatSystemMessage is ai:ChatSystemMessage {
-            ChatMessageDatabaseMessage dbMessage = transformToDatabaseMessage(finalChatSystemMessage);
-            sql:ExecutionResult|sql:Error upsertResult = self.updateSystemMessage(key, dbMessage);
-            if upsertResult is sql:Error {
-                return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
-            }
+        final int incoming = newInteractiveMessages.length();
+        if finalChatSystemMessage is () && incoming == 0 {
+            return;
         }
 
-        // Insert interactive messages in batch
-        if newInteractiveMessages.length() > 0 {
-            int|sql:Error currentCount = self.countInteractiveMessages(key);
-            if currentCount is sql:Error {
-                return error("Failed to add chat messages: " + currentCount.message(), currentCount);
-            }
-            int incoming = newInteractiveMessages.length();
+        sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
+            let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
+            select replaceTableNamePlaceholder(`
+                    INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+                    VALUES (${key}, ${msg.role}, ${dbMsg.toJsonString()})`,
+                    self.tableName
+                );
 
-            if currentCount + incoming > self.maxMessagesPerKey {
-                return createExceedsSizeError(self.maxMessagesPerKey, key);
+        // The capacity check, the system-message upsert, and the interactive-message batch insert
+        // all run in a single transaction, so the batch is either fully applied or fully rejected
+        // and the limit cannot be bypassed by a concurrent insert.
+        ExceedsSizeError? sizeError = ();
+        do {
+            transaction {
+                if incoming > 0 {
+                    int currentCount = check self.countInteractiveMessages(key);
+                    if currentCount + incoming > self.maxMessagesPerKey {
+                        sizeError = createExceedsSizeError(self.maxMessagesPerKey, key);
+                    }
+                }
+                if sizeError is ExceedsSizeError {
+                    rollback;
+                } else {
+                    if finalChatSystemMessage is ai:ChatSystemMessage {
+                        _ = check self.updateSystemMessage(key, transformToDatabaseMessage(finalChatSystemMessage));
+                    }
+                    if insertQueries.length() > 0 {
+                        _ = check self.dbClient->batchExecute(insertQueries);
+                    }
+                    check commit;
+                }
             }
-            sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
-                let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
-                select replaceTableNamePlaceholder(`
-                        INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                        VALUES (${key}, ${msg.role}, ${dbMsg.toJsonString()})`,
-                        self.tableName
-                    );
-            sql:ExecutionResult[]|sql:Error batchResult = self.dbClient->batchExecute(insertQueries);
-            if batchResult is sql:Error {
-                return error("Failed batch insert of interactive messages: " + batchResult.message(), batchResult);
-            }
+        } on fail error err {
+            return error("Failed to add chat messages: " + err.message(), err);
+        }
+        if sizeError is ExceedsSizeError {
+            return sizeError;
         }
 
-        final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = from ai:ChatInteractiveMessage message
-            in newInteractiveMessages
-            select <readonly & ai:ChatInteractiveMessage>mapToImmutableMessage(message);
+        // The cache is updated in place after a successful write so it stays warm.
+        final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages =
+            from ai:ChatInteractiveMessage msg in newInteractiveMessages
+            select <readonly & ai:ChatInteractiveMessage>mapToImmutableMessage(msg);
         self.updateCache(key, finalChatSystemMessage, immutableInteractiveMessages);
     }
 
@@ -281,7 +321,6 @@ public isolated class ShortTermMemoryStore {
             }
             cacheEntry.interactiveMessages.push(...interactiveMessages);
         }
-        return;
     }
 
     private isolated function updateSystemMessage(string key, ChatMessageDatabaseMessage systemMessage)
@@ -317,10 +356,8 @@ public isolated class ShortTermMemoryStore {
 
         lock {
             CachedMessages? cacheEntry = self.getCacheEntry(key);
-            if cacheEntry is CachedMessages {
-                if cacheEntry.hasKey("systemMessage") {
-                    cacheEntry.systemMessage = ();
-                }
+            if cacheEntry is CachedMessages && cacheEntry.hasKey("systemMessage") {
+                cacheEntry.systemMessage = ();
             }
         }
     }
@@ -329,10 +366,13 @@ public isolated class ShortTermMemoryStore {
     # message) for a given key.
     #
     # + key - The key associated with the memory
-    # + count - Optional number of messages to remove, starting from the first interactive message in;
+    # + count - Optional number of messages to remove, starting from the first interactive message;
     # if not provided, removes all messages
     # + return - nil on success, or an `Error` error if the operation fails
     public isolated function removeChatInteractiveMessages(string key, int? count = ()) returns Error? {
+        if count is int && count <= 0 {
+            return error(string `Invalid 'count': ${count}. It must be nil or a positive integer.`);
+        }
         if count is () {
             sql:ExecutionResult|sql:Error result = self.dbClient->execute(
                 replaceTableNamePlaceholder(`
@@ -403,17 +443,20 @@ public isolated class ShortTermMemoryStore {
     # + key - The key associated with the memory
     # + return - true if the memory store is full, false otherwise, or an `Error` error if the operation fails
     public isolated function isFull(string key) returns boolean|Error {
-        ai:ChatInteractiveMessage[]|Error interactiveMessages = self.getChatInteractiveMessages(key);
-
-        if interactiveMessages is Error {
-            error? cause = interactiveMessages.cause();
-            if cause is ExceedsSizeError {
-                return true;
+        lock {
+            CachedMessages? cacheEntry = self.getCacheEntry(key);
+            if cacheEntry is CachedMessages {
+                return cacheEntry.interactiveMessages.length() >= self.maxMessagesPerKey;
             }
-            return interactiveMessages;
         }
 
-        return interactiveMessages.length() >= self.maxMessagesPerKey;
+        // On a cache miss, only the count is needed, so use `COUNT(*)` rather than loading and
+        // deserializing every stored message.
+        int|sql:Error count = self.countInteractiveMessages(key);
+        if count is sql:Error {
+            return error("Failed to check if the memory store is full: " + count.message(), count);
+        }
+        return count >= self.maxMessagesPerKey;
     }
 
     private isolated function initializeDatabase() returns Error? {
@@ -492,9 +535,13 @@ public isolated class ShortTermMemoryStore {
             final ai:ChatInteractiveMessage[] & readonly immutableInteractiveMessages = interactiveMessages.cloneReadOnly();
             lock {
                 cache:Cache? cache = self.cache;
+                // Caching is best-effort: a failure to populate the cache does not fail the read.
                 if cache !is () && !cache.hasKey(key) {
-                    check cache.put(
+                    cache:Error? cacheErr = cache.put(
                         key, <CachedMessages>{systemMessage, interactiveMessages: [...immutableInteractiveMessages]});
+                    if cacheErr is cache:Error {
+                        // Ignore: the read result is still returned to the caller.
+                    }
                 }
             }
 
@@ -513,7 +560,7 @@ public isolated class ShortTermMemoryStore {
             if cache !is () && cache.hasKey(key) {
                 cache:Error? err = cache.invalidate(key);
                 if err is cache:Error {
-                    // Ignore, as this is for non-existent key
+                    // Ignore: the entry may already have been evicted.
                 }
             }
         }
