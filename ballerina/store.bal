@@ -25,21 +25,13 @@ public type Error distinct ai:MemoryError;
 
 type ExceedsSizeError distinct Error;
 
-# Database configuration for the SQLite client. Maps directly onto the
-# `ballerinax/java.jdbc` client constructor parameters; the SQLite JDBC
-# driver (`org.xerial:sqlite-jdbc`) is supplied as a platform dependency.
+# Database configuration for the SQLite client
 public type DatabaseConfiguration record {|
     # JDBC URL for the SQLite database, e.g., `jdbc:sqlite:./chat_memory.db`
     # or `jdbc:sqlite::memory:` for an in-process database
     string url = "jdbc:sqlite:./chat_memory.db";
-    # Database user (typically unused for SQLite; included for API parity)
-    string user?;
-    # Database password (typically unused for SQLite; included for API parity)
-    string password?;
-    # Additional options for the JDBC client
+    # Additional options for the SQLite JDBC client
     jdbc:Options options?;
-    # Connection pool configuration
-    sql:ConnectionPool connectionPool?;
 |};
 
 type CachedMessages record {|
@@ -79,10 +71,7 @@ public isolated class ShortTermMemoryStore {
         } else {
             jdbc:Client|sql:Error initializedClient = new jdbc:Client(
                 url = sqliteClient.url,
-                user = sqliteClient.user,
-                password = sqliteClient.password,
-                options = sqliteClient.options,
-                connectionPool = sqliteClient.connectionPool
+                options = sqliteClient.options
             );
             if initializedClient is sql:Error {
                 return error("Failed to create SQLite client: " + initializedClient.message(), initializedClient);
@@ -201,6 +190,13 @@ public isolated class ShortTermMemoryStore {
                 return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
             }
         } else {
+            int|sql:Error currentCount = self.countInteractiveMessages(key);
+            if currentCount is sql:Error {
+                return error("Failed to add chat message: " + currentCount.message(), currentCount);
+            }
+            if currentCount + 1 > self.maxMessagesPerKey {
+                return createExceedsSizeError(self.maxMessagesPerKey, key);
+            }
             do {
                 _ = check self.dbClient->execute(
                     replaceTableNamePlaceholder(`
@@ -245,13 +241,14 @@ public isolated class ShortTermMemoryStore {
 
         // Insert interactive messages in batch
         if newInteractiveMessages.length() > 0 {
-            ai:ChatInteractiveMessage[] oldInteractiveMesssages = check self.getChatInteractiveMessages(key);
-            int currentCount = oldInteractiveMesssages.length();
+            int|sql:Error currentCount = self.countInteractiveMessages(key);
+            if currentCount is sql:Error {
+                return error("Failed to add chat messages: " + currentCount.message(), currentCount);
+            }
             int incoming = newInteractiveMessages.length();
 
             if currentCount + incoming > self.maxMessagesPerKey {
-                return error(string `Cannot add more messages.`
-                    + string ` Maximum limit '${self.maxMessagesPerKey}' exceeded for key '${key}'`);
+                return createExceedsSizeError(self.maxMessagesPerKey, key);
             }
             sql:ParameterizedQuery[] insertQueries = from ai:ChatInteractiveMessage msg in newInteractiveMessages
                 let ChatMessageDatabaseMessage dbMsg = transformToDatabaseMessage(msg)
@@ -540,6 +537,22 @@ public isolated class ShortTermMemoryStore {
         }
     }
 
+    # Counts the interactive (non-system) messages currently stored for a given key.
+    #
+    # + key - The key associated with the memory
+    # + return - The number of interactive messages, or an `sql:Error` if the query fails
+    private isolated function countInteractiveMessages(string key) returns int|sql:Error {
+        int count = check self.dbClient->queryRow(
+            replaceTableNamePlaceholder(`
+                SELECT COUNT(*)
+                FROM $_tableName_$
+                WHERE message_key = ${key} AND message_role != 'system'`,
+                self.tableName
+            )
+        );
+        return count;
+    }
+
     # Retrieves the maximum number of interactive messages that can be stored for each key.
     #
     # + return - The configured capacity of the message store per key
@@ -581,3 +594,8 @@ isolated function getLatestSystemMessage(ai:ChatSystemMessage[] systemMessages)
     }
     return;
 }
+
+// Builds the error returned when an insert would exceed the per-key message limit.
+isolated function createExceedsSizeError(int maxMessagesPerKey, string key) returns ExceedsSizeError =>
+    error ExceedsSizeError(string `Cannot add more messages.`
+        + string ` Maximum limit '${maxMessagesPerKey}' exceeded for key '${key}'`);

@@ -854,3 +854,332 @@ function testSystemMessageRetrievalDoesNotPopulateCache() returns error? {
     // Retrieve all messages - should load from database and include K1M3
     check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2, K1M3]);
 }
+
+// =====================================================================
+// Initialization / configuration parameter tests
+// =====================================================================
+
+// Each store created from a `DatabaseConfiguration` below uses a `jdbc:sqlite::memory:`
+// URL. This exercises the connector-managed connection pool and gives each test a
+// fully isolated database with no scratch files to clean up.
+const string IN_MEMORY_URL = "jdbc:sqlite::memory:";
+
+@test:Config {}
+function testInitWithInMemoryDatabaseConfiguration() returns error? {
+    // Multiple operations must observe the same in-memory database. This only holds
+    // because the connector pins the pool to a single connection.
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL});
+
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    check assertSystemMessage(store, K1, K1SM1);
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
+    check assertAllMessages(store, K1, [K1SM1, K1M1, k1m2]);
+
+    check store.removeAll(K1);
+    check assertAllMessages(store, K1, []);
+}
+
+@test:Config {}
+function testInitWithDefaultDatabaseConfiguration() returns error? {
+    // The default URL is a file-backed database; use an explicit in-memory URL here
+    // so the test leaves no scratch files but still exercises the config record.
+    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL};
+    ShortTermMemoryStore store = check new (dbConfig);
+    check store.put(K1, K1M1);
+    check assertInteractiveMessages(store, K1, [K1M1]);
+}
+
+@test:Config {}
+function testInitWithExplicitConnectionPool() returns error? {
+    // A caller-supplied connection pool must be honoured (and made SQLite-safe).
+    sql:ConnectionPool connectionPool = {connectionTimeout: 45};
+    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionPool: connectionPool};
+    ShortTermMemoryStore store = check new (dbConfig);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
+}
+
+@test:Config {}
+function testInitWithFullConfiguration() returns error? {
+    cache:CacheConfig cacheConfig = {capacity: 10, evictionFactor: 0.2};
+    sql:ConnectionPool connectionPool = {maxOpenConnections: 1};
+    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionPool: connectionPool};
+    ShortTermMemoryStore store = check new (dbConfig, 15, cacheConfig, "custom_messages");
+
+    test:assertEquals(store.getCapacity(), 15);
+
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check assertAllMessages(store, K1, [K1SM1, K1M1]);
+}
+
+@test:Config {}
+function testInitWithCustomTableName() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, tableName = "agent_chat_history");
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    check assertAllMessages(store, K1, [K1SM1, K1M1]);
+}
+
+@test:Config {}
+function testInitWithInvalidTableName() {
+    string[] invalidNames = ["1table", "table-name", "table name", "table;drop", "",
+        "table.name", "robert'); DROP TABLE students;--"];
+    foreach string name in invalidNames {
+        ShortTermMemoryStore|Error store = new ({url: IN_MEMORY_URL}, tableName = name);
+        if store is ShortTermMemoryStore {
+            test:assertFail(string `Expected an error for invalid table name: '${name}'`);
+        } else {
+            test:assertTrue(store.message().includes("Invalid table name"),
+                "Unexpected error message: " + store.message());
+        }
+    }
+}
+
+@test:Config {}
+function testInitWithCacheConfiguration() returns error? {
+    cache:CacheConfig cacheConfig = {capacity: 5, evictionFactor: 0.25};
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, cacheConfig = cacheConfig);
+    check store.put(K1, K1SM1);
+    check store.put(K1, K1M1);
+    // First read loads from DB and populates the cache; second read is served from cache.
+    check assertAllMessages(store, K1, [K1SM1, K1M1]);
+    check assertAllMessages(store, K1, [K1SM1, K1M1]);
+}
+
+// =====================================================================
+// Capacity / fullness API tests
+// =====================================================================
+
+@test:Config {}
+function testGetCapacity() returns error? {
+    ShortTermMemoryStore defaultStore = check new ({url: IN_MEMORY_URL});
+    test:assertEquals(defaultStore.getCapacity(), 20);
+
+    ShortTermMemoryStore customStore = check new ({url: IN_MEMORY_URL}, 7);
+    test:assertEquals(customStore.getCapacity(), 7);
+}
+
+@test:Config {}
+function testIsFull() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
+
+    test:assertFalse(check store.isFull(K1));
+    check store.put(K1, K1M1);
+    test:assertFalse(check store.isFull(K1));
+    check store.put(K1, k1m2);
+    test:assertFalse(check store.isFull(K1));
+    check store.put(K1, K1M3);
+    test:assertTrue(check store.isFull(K1));
+
+    // A system message must not count towards fullness.
+    check store.put(K2, K1SM1);
+    test:assertFalse(check store.isFull(K2));
+}
+
+// =====================================================================
+// Overflow / message-limit enforcement tests
+// =====================================================================
+
+@test:Config {}
+function testPutSingleMessageExceedingLimit() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+    check store.put(K1, K1M3);
+
+    Error? result = store.put(K1, K1M4);
+    test:assertTrue(result is ExceedsSizeError,
+        "Expected an ExceedsSizeError when exceeding the per-key message limit");
+    if result is Error {
+        test:assertTrue(result.message().includes("Maximum limit '3' exceeded"),
+            "Unexpected error message: " + result.message());
+    }
+
+    // The rejected message must not have been persisted.
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2, K1M3]);
+
+    // A system message must still be storable even when interactive messages are full.
+    check store.put(K1, K1SM1);
+    check assertSystemMessage(store, K1, K1SM1);
+}
+
+@test:Config {}
+function testPutAllExceedingLimit() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
+    Error? result = store.put(K1, [K1M1, k1m2, K1M3, K1M4]);
+    test:assertTrue(result is ExceedsSizeError,
+        "Expected an ExceedsSizeError when the batch exceeds the per-key message limit");
+
+    // The rejected batch must not have been partially persisted.
+    check assertInteractiveMessages(store, K1, []);
+}
+
+@test:Config {}
+function testPutAllAtExactLimit() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
+    check store.put(K1, [K1M1, k1m2, K1M3]);
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2, K1M3]);
+    test:assertTrue(check store.isFull(K1));
+
+    Error? result = store.put(K1, K1M4);
+    test:assertTrue(result is ExceedsSizeError, "Expected an ExceedsSizeError at capacity");
+}
+
+@test:Config {}
+function testPutExceedingLimitAcrossMultipleCalls() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 2);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    Error? result = store.put(K1, [K1M3]);
+    test:assertTrue(result is ExceedsSizeError, "Expected an ExceedsSizeError once at capacity");
+    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
+}
+
+@test:Config {}
+function testRemoveInteractiveMessagesCountExceedingAvailable() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 5);
+    check store.put(K1, K1M1);
+    check store.put(K1, k1m2);
+
+    // A removal count larger than the stored count removes everything available.
+    check store.removeChatInteractiveMessages(K1, 10);
+    check assertInteractiveMessages(store, K1, []);
+
+    // Capacity is freed up again after the removal.
+    check store.put(K1, K1M3);
+    check assertInteractiveMessages(store, K1, [K1M3]);
+}
+
+// =====================================================================
+// Message-content round-trip tests
+// =====================================================================
+
+@test:Config {}
+function testPromptContentRoundTrip() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL});
+
+    string city = "Seattle";
+    int day = 3;
+    ai:Prompt userPrompt = `What is the weather in ${city} on day ${day}?`;
+    ai:ChatUserMessage userMsg = {role: ai:USER, content: userPrompt};
+
+    ai:Prompt systemPrompt = `You are a ${"weather"} assistant.`;
+    ai:ChatSystemMessage systemMsg = {role: ai:SYSTEM, content: systemPrompt};
+
+    check store.put(K1, systemMsg);
+    check store.put(K1, userMsg);
+
+    check assertSystemMessage(store, K1, systemMsg);
+    check assertInteractiveMessages(store, K1, [userMsg]);
+    check assertAllMessages(store, K1, [systemMsg, userMsg]);
+}
+
+@test:Config {}
+function testAssistantMessageWithToolCalls() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL});
+    ai:ChatAssistantMessage assistantMsg = {
+        role: ai:ASSISTANT,
+        content: (),
+        toolCalls: [
+            {name: "getWeather", arguments: {"city": "Seattle"}, id: "call_1"},
+            {name: "getTime", arguments: {"zone": "PST"}, id: "call_2"}
+        ]
+    };
+
+    check store.put(K1, K1M1);
+    check store.put(K1, assistantMsg);
+    check assertInteractiveMessages(store, K1, [K1M1, assistantMsg]);
+    check assertAllMessages(store, K1, [K1M1, assistantMsg]);
+}
+
+@test:Config {}
+function testFunctionMessageRoundTrip() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL});
+    ai:ChatFunctionMessage funcMsg = {role: "function", name: "getWeather", id: "fn_1"};
+    check store.put(K1, funcMsg);
+    check assertInteractiveMessages(store, K1, [funcMsg]);
+}
+
+// =====================================================================
+// Trim / overflow integration tests via `ai:ShortTermMemory`
+// =====================================================================
+
+@test:Config {}
+function testTrimOverflowWithShortTermMemory() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 4);
+    ai:ShortTermMemory memory = check new (store, <ai:TrimOverflowHandlerConfiguration>{trimCount: 2});
+
+    ai:ChatUserMessage m1 = {role: ai:USER, content: "message 1"};
+    ai:ChatUserMessage m2 = {role: ai:USER, content: "message 2"};
+    ai:ChatUserMessage m3 = {role: ai:USER, content: "message 3"};
+    ai:ChatUserMessage m4 = {role: ai:USER, content: "message 4"};
+    ai:ChatUserMessage m5 = {role: ai:USER, content: "message 5"};
+    ai:ChatUserMessage m6 = {role: ai:USER, content: "message 6"};
+
+    check memory.update(K1, m1);
+    check memory.update(K1, m2);
+    check memory.update(K1, m3);
+    check memory.update(K1, m4);
+
+    // Store holds [m1, m2, m3, m4] - exactly at capacity.
+    ai:ChatMessage[] afterFour = check memory.get(K1);
+    test:assertEquals(afterFour.length(), 4);
+
+    // Overflow: the two oldest messages are trimmed before m5 is stored.
+    check memory.update(K1, m5);
+    ai:ChatMessage[] afterFive = check memory.get(K1);
+    test:assertEquals(afterFive.length(), 3);
+    assertChatMessageEquals(afterFive[0], m3);
+    assertChatMessageEquals(afterFive[2], m5);
+
+    // No overflow here - back to capacity.
+    check memory.update(K1, m6);
+    ai:ChatMessage[] afterSix = check memory.get(K1);
+    test:assertEquals(afterSix.length(), 4);
+    assertChatMessageEquals(afterSix[0], m3);
+    assertChatMessageEquals(afterSix[3], m6);
+}
+
+@test:Config {}
+function testTrimOverflowPreservesSystemMessage() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
+    ai:ShortTermMemory memory = check new (store, <ai:TrimOverflowHandlerConfiguration>{trimCount: 1});
+
+    check memory.update(K1, K1SM1);
+    check memory.update(K1, K1M1);
+    check memory.update(K1, k1m2);
+    check memory.update(K1, K1M3);
+    // Overflow trims one interactive message; the system message must survive.
+    check memory.update(K1, K1M4);
+
+    ai:ChatMessage[] messages = check memory.get(K1);
+    ai:ChatMessage first = messages[0];
+    test:assertTrue(first is ai:ChatSystemMessage, "System message must be retained after trimming");
+    test:assertEquals(messages.length(), 4);
+}
+
+@test:Config {}
+function testShortTermMemoryIntegrationWithSystemMessage() returns error? {
+    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 10);
+    ai:ShortTermMemory memory = check new (store);
+
+    check memory.update(K1, K1SM1);
+    check memory.update(K1, K1M1);
+    check memory.update(K1, k1m2);
+
+    ai:ChatMessage[] messages = check memory.get(K1);
+    test:assertEquals(messages.length(), 3);
+    assertChatMessageEquals(messages[0], K1SM1);
+    assertChatMessageEquals(messages[1], K1M1);
+    assertChatMessageEquals(messages[2], k1m2);
+
+    check memory.delete(K1);
+    ai:ChatMessage[] afterDelete = check memory.get(K1);
+    test:assertEquals(afterDelete.length(), 0);
+}
