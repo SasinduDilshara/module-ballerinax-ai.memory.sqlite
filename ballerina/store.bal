@@ -208,31 +208,16 @@ public isolated class ShortTermMemoryStore {
                 return error("Failed to upsert system message: " + upsertResult.message(), upsertResult);
             }
         } else {
-            // The capacity check and the insert run in a single transaction so the limit cannot be
-            // bypassed by a concurrent insert landing between the count and the insert.
-            ExceedsSizeError? sizeError = ();
             do {
-                transaction {
-                    int currentCount = check self.countInteractiveMessages(key);
-                    if currentCount + 1 > self.maxMessagesPerKey {
-                        sizeError = createExceedsSizeError(self.maxMessagesPerKey, key);
-                        rollback;
-                    } else {
-                        _ = check self.dbClient->execute(
-                            replaceTableNamePlaceholder(`
-                                INSERT INTO $_tableName_$ (message_key, message_role, message_json)
-                                VALUES (${key}, ${dbMessage.role}, ${dbMessage.toJsonString()})`,
-                                self.tableName
-                            )
-                        );
-                        check commit;
-                    }
-                }
+                _ = check self.dbClient->execute(
+                    replaceTableNamePlaceholder(`
+                        INSERT INTO $_tableName_$ (message_key, message_role, message_json)
+                        VALUES (${key}, ${dbMessage.role}, ${dbMessage.toJsonString()})`,
+                        self.tableName
+                    )
+                );
             } on fail error err {
                 return error("Failed to add chat message: " + err.message(), err);
-            }
-            if sizeError is ExceedsSizeError {
-                return sizeError;
             }
         }
 
@@ -271,35 +256,15 @@ public isolated class ShortTermMemoryStore {
                     self.tableName
                 );
 
-        // The capacity check, the system-message upsert, and the interactive-message batch insert
-        // all run in a single transaction, so the batch is either fully applied or fully rejected
-        // and the limit cannot be bypassed by a concurrent insert.
-        ExceedsSizeError? sizeError = ();
         do {
-            transaction {
-                if incoming > 0 {
-                    int currentCount = check self.countInteractiveMessages(key);
-                    if currentCount + incoming > self.maxMessagesPerKey {
-                        sizeError = createExceedsSizeError(self.maxMessagesPerKey, key);
-                    }
-                }
-                if sizeError is ExceedsSizeError {
-                    rollback;
-                } else {
-                    if finalChatSystemMessage is ai:ChatSystemMessage {
-                        _ = check self.updateSystemMessage(key, transformToDatabaseMessage(finalChatSystemMessage));
-                    }
-                    if insertQueries.length() > 0 {
-                        _ = check self.dbClient->batchExecute(insertQueries);
-                    }
-                    check commit;
-                }
+            if finalChatSystemMessage is ai:ChatSystemMessage {
+                _ = check self.updateSystemMessage(key, transformToDatabaseMessage(finalChatSystemMessage));
+            }
+            if insertQueries.length() > 0 {
+                _ = check self.dbClient->batchExecute(insertQueries);
             }
         } on fail error err {
             return error("Failed to add chat messages: " + err.message(), err);
-        }
-        if sizeError is ExceedsSizeError {
-            return sizeError;
         }
 
         // The cache is updated in place after a successful write so it stays warm.

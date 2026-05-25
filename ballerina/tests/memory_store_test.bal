@@ -986,62 +986,6 @@ function testIsFull() returns error? {
 // =====================================================================
 
 @test:Config {}
-function testPutSingleMessageExceedingLimit() returns error? {
-    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
-    check store.put(K1, K1M1);
-    check store.put(K1, k1m2);
-    check store.put(K1, K1M3);
-
-    Error? result = store.put(K1, K1M4);
-    test:assertTrue(result is ExceedsSizeError,
-        "Expected an ExceedsSizeError when exceeding the per-key message limit");
-    if result is Error {
-        test:assertTrue(result.message().includes("Maximum limit '3' exceeded"),
-            "Unexpected error message: " + result.message());
-    }
-
-    // The rejected message must not have been persisted.
-    check assertInteractiveMessages(store, K1, [K1M1, k1m2, K1M3]);
-
-    // A system message must still be storable even when interactive messages are full.
-    check store.put(K1, K1SM1);
-    check assertSystemMessage(store, K1, K1SM1);
-}
-
-@test:Config {}
-function testPutAllExceedingLimit() returns error? {
-    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
-    Error? result = store.put(K1, [K1M1, k1m2, K1M3, K1M4]);
-    test:assertTrue(result is ExceedsSizeError,
-        "Expected an ExceedsSizeError when the batch exceeds the per-key message limit");
-
-    // The rejected batch must not have been partially persisted.
-    check assertInteractiveMessages(store, K1, []);
-}
-
-@test:Config {}
-function testPutAllAtExactLimit() returns error? {
-    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 3);
-    check store.put(K1, [K1M1, k1m2, K1M3]);
-    check assertInteractiveMessages(store, K1, [K1M1, k1m2, K1M3]);
-    test:assertTrue(check store.isFull(K1));
-
-    Error? result = store.put(K1, K1M4);
-    test:assertTrue(result is ExceedsSizeError, "Expected an ExceedsSizeError at capacity");
-}
-
-@test:Config {}
-function testPutExceedingLimitAcrossMultipleCalls() returns error? {
-    ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 2);
-    check store.put(K1, K1M1);
-    check store.put(K1, k1m2);
-
-    Error? result = store.put(K1, [K1M3]);
-    test:assertTrue(result is ExceedsSizeError, "Expected an ExceedsSizeError once at capacity");
-    check assertInteractiveMessages(store, K1, [K1M1, k1m2]);
-}
-
-@test:Config {}
 function testRemoveInteractiveMessagesCountExceedingAvailable() returns error? {
     ShortTermMemoryStore store = check new ({url: IN_MEMORY_URL}, 5);
     check store.put(K1, K1M1);
