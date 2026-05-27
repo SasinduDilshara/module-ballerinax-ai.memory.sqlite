@@ -5,8 +5,9 @@ name = "ai.memory.sqlite"
 version = "1.0.0"
 license = ["Apache-2.0"]
 authors = ["Ballerina"]
-keywords = ["Type/Connector", "Vendor/SQLite", "Area/AI & Machine Learning", "Area/Database"]
+keywords = ["Type/Connector", "Vendor/SQLite", "Area/AI & Machine Learning", "Area/Database", "Type/Short Term Memory Store", "Name/SQLLite Memory Store"]
 repository = "https://github.com/ballerina-platform/module-ballerinax-ai.memory.sqlite"
+icon = "icon.png"
 
 [platform.java21]
 graalvmCompatible = true
