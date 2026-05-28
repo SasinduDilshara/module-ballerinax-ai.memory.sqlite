@@ -859,9 +859,9 @@ function testSystemMessageRetrievalDoesNotPopulateCache() returns error? {
 // Initialization / configuration parameter tests
 // =====================================================================
 
-// Each store created from a `DatabaseConfiguration` below uses a `jdbc:sqlite::memory:`
-// URL. This exercises the connector-managed connection pool and gives each test a
-// fully isolated database with no scratch files to clean up.
+// Each store created from a `DatabaseConfiguration` below uses `jdbc:sqlite::memory:`.
+// This exercises the connector-managed connection pool and gives each test a fully
+// isolated database with no scratch files to clean up.
 const string IN_MEMORY_URL = "jdbc:sqlite::memory:";
 
 @test:Config {}
@@ -883,9 +883,8 @@ function testInitWithInMemoryDatabaseConfiguration() returns error? {
 }
 
 @test:Config {}
-function testInitWithDefaultDatabaseConfiguration() returns error? {
-    // The default URL is a file-backed database; use an explicit in-memory URL here
-    // so the test leaves no scratch files but still exercises the config record.
+function testInitWithMinimalDatabaseConfiguration() returns error? {
+    // Only the mandatory `url` field is set; everything else uses defaults.
     DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL};
     ShortTermMemoryStore store = check new (dbConfig);
     check store.put(K1, K1M1);
@@ -893,10 +892,9 @@ function testInitWithDefaultDatabaseConfiguration() returns error? {
 }
 
 @test:Config {}
-function testInitWithExplicitConnectionPool() returns error? {
-    // A caller-supplied connection pool must be honoured (and made SQLite-safe).
-    sql:ConnectionPool connectionPool = {connectionTimeout: 45};
-    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionPool: connectionPool};
+function testInitWithCustomConnectionTimeout() returns error? {
+    // A caller-supplied connection timeout must be honoured.
+    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionTimeout: 45};
     ShortTermMemoryStore store = check new (dbConfig);
     check store.put(K1, K1M1);
     check store.put(K1, k1m2);
@@ -904,10 +902,35 @@ function testInitWithExplicitConnectionPool() returns error? {
 }
 
 @test:Config {}
+function testInitWithCustomOptions() returns error? {
+    // A caller-supplied options record must be applied to the connection.
+    DatabaseConfiguration dbConfig = {
+        url: IN_MEMORY_URL,
+        options: {
+            journalMode: "MEMORY",
+            busyTimeout: 1000
+        }
+    };
+    ShortTermMemoryStore store = check new (dbConfig);
+    check store.put(K1, K1M1);
+    check assertInteractiveMessages(store, K1, [K1M1]);
+}
+
+@test:Config {}
+function testInitWithInvalidJdbcUrl() {
+    DatabaseConfiguration dbConfig = {url: "jdbc:postgresql://localhost/foo"};
+    ShortTermMemoryStore|Error store = new (dbConfig);
+    if store is ShortTermMemoryStore {
+        test:assertFail("Expected an error for a non-SQLite JDBC URL");
+    }
+    test:assertTrue(store.message().includes("must start with 'jdbc:sqlite:'"),
+        "Unexpected error message: " + store.message());
+}
+
+@test:Config {}
 function testInitWithFullConfiguration() returns error? {
     cache:CacheConfig cacheConfig = {capacity: 10, evictionFactor: 0.2};
-    sql:ConnectionPool connectionPool = {maxOpenConnections: 1};
-    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionPool: connectionPool};
+    DatabaseConfiguration dbConfig = {url: IN_MEMORY_URL, connectionTimeout: 30};
     ShortTermMemoryStore store = check new (dbConfig, 15, cacheConfig, "custom_messages");
 
     test:assertEquals(store.getCapacity(), 15);

@@ -25,20 +25,32 @@ public type Error distinct ai:MemoryError;
 
 type ExceedsSizeError distinct Error;
 
-# Database configuration for the SQLite client
+# Database configuration for the SQLite-backed memory store.
 public type DatabaseConfiguration record {|
-    # JDBC URL for the SQLite database, e.g., `jdbc:sqlite:./chat_memory.db`
-    # or `jdbc:sqlite::memory:` for an in-process database
-    string url = "jdbc:sqlite:./chat_memory.db";
-    # Additional options for the SQLite JDBC client
-    jdbc:Options options?;
-    # Connection pool configuration.
-    sql:ConnectionPool connectionPool = {
-        maxOpenConnections: 1,
-        minIdleConnections: 1,
-        maxConnectionLifeTime: 0
-    };
+    # JDBC URL for the SQLite database (e.g., `jdbc:sqlite:./chat.db`,
+    # `jdbc:sqlite::memory:`, or `jdbc:sqlite:./chat.db?cache=shared`).
+    # Must start with `jdbc:sqlite:`.
+    string url;
+    # SQLite session-level options applied to each new connection.
+    Options options = {};
+    # Seconds to wait for a connection from the pool before failing.
+    decimal connectionTimeout = 30.0;
 |};
+
+# SQLite session-level options applied to each new connection. Any field left
+# unset falls back to SQLite's own default for that PRAGMA.
+public type Options record {|
+    # Journaling mode (`PRAGMA journal_mode`). When unset, SQLite's default (`DELETE`)
+    # is used. Consider `WAL` for workloads that benefit from concurrent readers.
+    JournalMode journalMode?;
+    # Milliseconds SQLite waits when the database is locked before returning `SQLITE_BUSY`
+    # (`PRAGMA busy_timeout`). When unset, SQLite's default (`0`, fail immediately) is used.
+    # Set a positive value to give a competing writer time to release the lock.
+    int busyTimeout?;
+|};
+
+# SQLite journaling mode (`PRAGMA journal_mode`).
+public type JournalMode "DELETE"|"TRUNCATE"|"PERSIST"|"MEMORY"|"WAL"|"OFF";
 
 type CachedMessages record {|
     readonly & ai:ChatSystemMessage systemMessage?;
@@ -58,14 +70,14 @@ public isolated class ShortTermMemoryStore {
 
     # Initializes the SQLite-backed short-term memory store.
     #
-    # + sqliteClient - The SQLite JDBC client or database configuration to connect to the database
+    # + dbClient - The SQLite JDBC client or database configuration to connect to the database
     # + maxMessagesPerKey - The maximum number of interactive messages to store per key (must be a
     # positive integer; default: 20)
     # + cacheConfig - The cache configuration for in-memory caching of messages (default: no caching)
     # + tableName - The name of the database table to store chat messages (default: "chat_messages").
     # Must start with a letter or underscore and contain only letters, digits, and underscores.
     # + return - An error if the initialization fails
-    public isolated function init(jdbc:Client|DatabaseConfiguration sqliteClient,
+    public isolated function init(jdbc:Client|DatabaseConfiguration dbClient,
             int maxMessagesPerKey = 20,
             cache:CacheConfig? cacheConfig = (),
             string tableName = "chat_messages") returns Error? {
@@ -79,14 +91,27 @@ public isolated class ShortTermMemoryStore {
                 + " It must be a positive integer.");
         }
         self.tableName = tableName;
-        if sqliteClient is jdbc:Client {
-            self.dbClient = sqliteClient;
+        if dbClient is jdbc:Client {
+            self.dbClient = dbClient;
             self.ownsDbClient = false;
         } else {
+            if !dbClient.url.startsWith("jdbc:sqlite:") {
+                return error(string `Invalid 'url': '${dbClient.url}'.`
+                    + " SQLite JDBC URLs must start with 'jdbc:sqlite:'.");
+            }
+            // SQLite is single-writer; the pool is pinned to one connection regardless of
+            // the user-supplied config so the store cannot be misconfigured into SQLITE_BUSY,
+            // and so `:memory:` databases (which are per-connection) remain coherent.
+            sql:ConnectionPool pool = {
+                maxOpenConnections: 1,
+                minIdleConnections: 1,
+                maxConnectionLifeTime: 0,
+                connectionTimeout: dbClient.connectionTimeout,
+                connectionInitSql: buildInitSqlStatements(dbClient.options)
+            };
             jdbc:Client|sql:Error initializedClient = new jdbc:Client(
-                url = sqliteClient.url,
-                options = sqliteClient.options,
-                connectionPool = sqliteClient.connectionPool
+                url = dbClient.url,
+                connectionPool = pool
             );
             if initializedClient is sql:Error {
                 return error("Failed to create SQLite client: " + initializedClient.message(), initializedClient);
@@ -611,3 +636,16 @@ isolated function getLatestSystemMessage(ai:ChatSystemMessage[] systemMessages)
 isolated function createExceedsSizeError(int maxMessagesPerKey, string key) returns ExceedsSizeError =>
     error ExceedsSizeError(string `Cannot add more messages.`
         + string ` Maximum limit '${maxMessagesPerKey}' exceeded for key '${key}'`);
+
+isolated function buildInitSqlStatements(Options options) returns string[] {
+    string[] statements = [];
+    JournalMode? journalMode = options?.journalMode;
+    if journalMode is JournalMode {
+        statements.push(string `PRAGMA journal_mode = ${journalMode}`);
+    }
+    int? busyTimeout = options?.busyTimeout;
+    if busyTimeout is int {
+        statements.push(string `PRAGMA busy_timeout = ${busyTimeout}`);
+    }
+    return statements;
+}
